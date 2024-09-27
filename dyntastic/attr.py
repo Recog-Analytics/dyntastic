@@ -29,7 +29,7 @@ def serialize(data):
         # TODO: May not actually want to filter out None. Without the filter,
         # all None fields in the pydantic model appear as Null instead of
         # nonexistent
-        return {key: serialize(value) for key, value in data.items() if value is not None}
+        return {key: serialize(value) for key, value in data.items()}
     elif isinstance(data, (list, tuple)):
         return list(map(serialize, data))
     elif isinstance(data, set):
