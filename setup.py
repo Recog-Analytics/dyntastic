@@ -12,27 +12,10 @@ changelog = (ROOT_DIRECTORY / "CHANGELOG.md").read_text()
 long_description = readme + "\n\n" + changelog
 
 
-DEV_REQUIRES = [
-    "black",
-    "boto3-stubs[dynamodb]",
-    "coverage",
-    "flake8==6.0.0; python_version > '3.7'",
-    "flake8<5; python_version == '3.7'",
-    "flake8-bugbear",
-    "isort",
-    "moto==4.2.2",
-    "mypy",
-    "pre-commit",
-    "pytest",
-    "pytest-cov",
-    "pytest-mock",
-    "pytest-sugar",
-    "pytest-xdist",
-]
 
 setup(
     name="dyntastic",
-    version="0.15.0",
+    version="0.15.1",
     description=description,
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -51,10 +34,7 @@ setup(
         "importlib-metadata>=1.0.0; python_version < '3.8'",
     ],
     python_requires=">=3.7",
-    extras_require={
-        "dev": DEV_REQUIRES,
-        "deploy": ["twine"],
-    },
+
     package_data={"dyntastic": ["py.typed"]},
     include_package_data=True,
 )
