@@ -110,7 +110,6 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         if not secret:
             raise ValueError("COSMOS_SECRET environment variable not set")
         uri = f"https://{cls.__database_name__}.documents.azure.com:443/"
-        print(uri)
         cosmos_client = CosmosClient(
             uri,
             credential=secret,

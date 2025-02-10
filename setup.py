@@ -6,11 +6,12 @@ ROOT_DIRECTORY = Path(__file__).resolve().parent
 
 readme = (ROOT_DIRECTORY / "README.md").read_text()
 description = next(
-    line for line in readme.splitlines() if line and not line.startswith("#") and not line.startswith("[")
+    line
+    for line in readme.splitlines()
+    if line and not line.startswith("#") and not line.startswith("[")
 )
 changelog = (ROOT_DIRECTORY / "CHANGELOG.md").read_text()
 long_description = readme + "\n\n" + changelog
-
 
 
 setup(
@@ -32,9 +33,10 @@ setup(
         "boto3>=1.20.0; python_version >= '3.12'",
         "pydantic>=1.7.1,<3",
         "importlib-metadata>=1.0.0; python_version < '3.8'",
+        "azure-cosmos>=4.9.0",
+        "azure-identity>=1.12.0",
     ],
     python_requires=">=3.7",
-
     package_data={"dyntastic": ["py.typed"]},
     include_package_data=True,
 )
