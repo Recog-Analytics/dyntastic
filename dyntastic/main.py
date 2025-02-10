@@ -2,7 +2,20 @@ import os
 import time
 import warnings
 from decimal import Decimal
-from typing import Any, Callable, Dict, Generator, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from enum import Enum
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    Generic,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import boto3
 
@@ -15,6 +28,10 @@ except ModuleNotFoundError:  # pragma: no cover
 
 from contextvars import ContextVar
 
+from azure.cosmos import CosmosClient
+from azure.cosmos.container import ContainerProxy
+from azure.cosmos.exceptions import CosmosHttpResponseError
+from azure.identity import DefaultAzureCredential
 from boto3.dynamodb.conditions import ConditionBase
 from pydantic import BaseModel, PrivateAttr
 
@@ -29,6 +46,14 @@ __version__ = _metadata.version("dyntastic")
 _T = TypeVar("_T", bound="Dyntastic")
 
 
+class HostProvider(Enum):
+    AWS = "aws"
+    AZURE = "azure"
+
+
+host_provider = HostProvider(os.getenv("HOST_PROVIDER", HostProvider.AWS.value))
+
+
 class _TableMetadata:
     __table_name__: Union[str, Callable[[], str]]
     __table_region__: Optional[str] = None
@@ -36,8 +61,6 @@ class _TableMetadata:
 
     __hash_key__: str
     __range_key__: Optional[str] = None
-
-    _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]]
 
 
 class ResultPage(Generic[_T]):
@@ -78,6 +101,22 @@ class Index:
 class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     _dyntastic_unrefreshed: bool = PrivateAttr(default=False)
     _dyntastic_missing_attributes_from_index: bool = PrivateAttr(default=False)
+    _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]]
+    __database_name__: str = os.getenv("COSMOS_DATABASE_NAME")  # just for cosmos impl.
+
+    @classmethod
+    def _get_cosmos_client(cls) -> ContainerProxy:
+        secret = os.getenv("COSMOS_SECRET")
+        if not secret:
+            raise ValueError("COSMOS_SECRET environment variable not set")
+        uri = f"https://{cls.__database_name__}.documents.azure.com:443/"
+        print(uri)
+        cosmos_client = CosmosClient(
+            uri,
+            credential=secret,
+        )
+        database_client = cosmos_client.get_database_client("relisten")
+        return database_client.get_container_client(cls.__table_name__)
 
     @classmethod
     def get_model(cls, item: dict):
@@ -141,7 +180,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             range_key_type = pydantic_compat.field_type(cls, cls.__range_key__)
 
         if range_key is None:
-            raise ValueError(f"Range key required but not provided to {cls.__name__}.{method}()")
+            raise ValueError(
+                f"Range key required but not provided to {cls.__name__}.{method}()"
+            )
 
         # TODO: In order to run the following check, we would need to support
         #       *deserializing* the range key e.g. from a string to a datetime, just
@@ -156,9 +197,13 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         return attr.serialize(key)
 
     @classmethod
-    def get(cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False) -> _T:
+    def get_aws(
+        cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False
+    ) -> _T:
         serialized_key = cls._serialize_key("get", hash_key, range_key)
-        response = cls._dynamodb_table().get_item(Key=serialized_key, ConsistentRead=consistent_read)
+        response = cls._dynamodb_table().get_item(
+            Key=serialized_key, ConsistentRead=consistent_read
+        )
         data = response.get("Item")
         if data:
             return cls._dyntastic_load_model(data)
@@ -166,11 +211,69 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             raise DoesNotExist
 
     @classmethod
-    def safe_get(cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False) -> Optional[_T]:
+    def safe_get_aws(
+        cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False
+    ) -> Optional[_T]:
         try:
-            return cls.get(hash_key, range_key=range_key, consistent_read=consistent_read)
+            return cls.get_aws(
+                hash_key, range_key=range_key, consistent_read=consistent_read
+            )
         except DoesNotExist:
             return None
+
+    @classmethod
+    def get_azure(
+        cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False
+    ) -> _T:
+        container_client = cls._get_cosmos_client()
+
+        document_id = str(hash_key)
+
+        try:
+            if cls.__range_key__ and not range_key:
+                raise ValueError(
+                    f"Range key required but not provided to {cls.__name__}.get_azure()"
+                )
+
+            # partition key is the range key since our implementation of range keys is
+            # to just use the hash key as id and the range key as the partition key
+            read_item_args = {}
+            if cls.__range_key__ and range_key:
+                read_item_args["partition_key"] = range_key
+            else:
+                read_item_args["partition_key"] = document_id
+            item = container_client.read_item(item=document_id, **read_item_args)
+            return cls._cosmos_to_model(item)
+        except CosmosHttpResponseError as e:
+            if e.status_code == 404:
+                raise DoesNotExist(f"Item with key {document_id} does not exist")
+            raise
+
+    @classmethod
+    def safe_get_azure(
+        cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False
+    ) -> Optional[_T]:
+        try:
+            return cls.get_azure(
+                hash_key, range_key=range_key, consistent_read=consistent_read
+            )
+        except DoesNotExist:
+            return None
+
+    @classmethod
+    def safe_get(
+        cls: Type[_T], hash_key, range_key=None, *, consistent_read: bool = False
+    ) -> Optional[_T]:
+        if host_provider == HostProvider.AWS:
+            return cls.safe_get_aws(
+                hash_key, range_key, consistent_read=consistent_read
+            )
+        elif host_provider == HostProvider.AZURE:
+            return cls.safe_get_azure(
+                hash_key, range_key, consistent_read=consistent_read
+            )
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
 
     @classmethod
     def batch_get(
@@ -185,17 +288,26 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
 
         serialized_keys = []
         for key in keys:
-            if cls.__range_key__ and (not isinstance(key, (list, tuple)) or len(key) != 2):
+            if cls.__range_key__ and (
+                not isinstance(key, (list, tuple)) or len(key) != 2
+            ):
                 raise ValueError(
                     f"Must provide (hash_key, range_key) tuples as `keys` to {cls.__name__}.batch_get(), got {key}"
                 )
             hash_key, range_key = key if cls.__range_key__ else (key, None)
-            serialized_key = cls._serialize_key("batch_get", hash_key, range_key, hash_key_type, range_key_type)
+            serialized_key = cls._serialize_key(
+                "batch_get", hash_key, range_key, hash_key_type, range_key_type
+            )
             serialized_keys.append(serialized_key)
 
         responses = invoke_with_backoff(
             cls._dynamodb_resource().batch_get_item,
-            {cls._resolve_table_name(): {"Keys": serialized_keys, "ConsistentRead": consistent_read}},
+            {
+                cls._resolve_table_name(): {
+                    "Keys": serialized_keys,
+                    "ConsistentRead": consistent_read,
+                }
+            },
             "UnprocessedKeys",
         )
 
@@ -254,12 +366,16 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         load_full_item: bool = False,
     ) -> ResultPage[_T]:
         if index and consistent_read:
-            raise ValueError("Cannot perform a consistent read against a secondary index")
+            raise ValueError(
+                "Cannot perform a consistent read against a secondary index"
+            )
 
         if isinstance(hash_key, ConditionBase):
             key_condition = hash_key
         elif index is not None:
-            raise ValueError("Must specify attribute condition for index, e.g. A.my_index_hash_key == 'example_value'")
+            raise ValueError(
+                "Must specify attribute condition for index, e.g. A.my_index_hash_key == 'example_value'"
+            )
         else:
             key_condition: ConditionBase = Attr(cls.__hash_key__) == hash_key  # type: ignore
 
@@ -278,7 +394,10 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         )
 
         raw_items = response.get("Items")
-        items = [cls._dyntastic_load_model(item, load_full_item=load_full_item) for item in raw_items]
+        items = [
+            cls._dyntastic_load_model(item, load_full_item=load_full_item)
+            for item in raw_items
+        ]
         last_evaluated_key = response.get("LastEvaluatedKey")
 
         return ResultPage(items, last_evaluated_key)
@@ -294,8 +413,163 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         last_evaluated_key: Optional[dict] = None,
         load_full_item: bool = False,
     ):
+        if host_provider == HostProvider.AWS:
+            return cls.scan_aws(
+                filter_condition=filter_condition,
+                consistent_read=consistent_read,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                load_full_item=load_full_item,
+            )
+        elif host_provider == HostProvider.AZURE:
+            return cls.scan_azure(
+                filter_condition=filter_condition,
+                consistent_read=consistent_read,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                load_full_item=load_full_item,
+            )
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
+
+    @classmethod
+    def scan_azure(
+        cls: Type[_T],
+        filter_condition: Optional[ConditionBase] = None,
+        *,
+        consistent_read: bool = False,
+        index: Optional[str] = None,
+        per_page: Optional[int] = None,
+        last_evaluated_key: Optional[dict] = None,
+        load_full_item: bool = False,
+    ):
+        container_client: ContainerProxy = cls._get_cosmos_client()
+
+        # Build the query
+        query = "SELECT * FROM c"
+        parameters = []
+
+        # Add filter condition if provided
+        if filter_condition:
+            # Convert DynamoDB filter condition to Cosmos DB SQL WHERE clause
+            where_clause = cls._convert_filter_to_cosmos(filter_condition)
+            if where_clause:
+                query += f" WHERE {where_clause}"
+
+        # Handle pagination
+        if per_page:
+            query += (
+                f" OFFSET {last_evaluated_key.get('offset', 0)} LIMIT {per_page}"
+                if last_evaluated_key
+                else f" LIMIT {per_page}"
+            )
+
+        # Execute query
+        query_iterable = container_client.query_items(
+            query=query,
+            parameters=parameters,
+            enable_cross_partition_query=True,  # Enable cross-partition query
+            max_item_count=per_page,
+        )
+
+        # Process results
+        items = []
+        continuation_token = None
+
+        for item in query_iterable:
+            items.append(cls._cosmos_to_model(item, load_full_item))
+
+            # Get continuation token if available
+            if hasattr(query_iterable, "continuation_token"):
+                continuation_token = query_iterable.continuation_token
+        # Prepare last evaluated key
+        if continuation_token:
+            last_evaluated_key = {
+                "continuation_token": continuation_token,
+                "offset": (last_evaluated_key.get("offset", 0) + len(items))
+                if last_evaluated_key
+                else len(items),
+            }
+        else:
+            last_evaluated_key = None
+
+        return items
+
+    @classmethod
+    def _convert_filter_to_cosmos(cls, filter_condition: ConditionBase) -> str:
+        """
+        Convert DynamoDB filter condition to Cosmos DB SQL WHERE clause
+        """
+        if not filter_condition:
+            return ""
+
+        # Implementation depends on your ConditionBase structure
+        # Example conversion:
+        operator_map = {
+            "=": "=",
+            "<>": "!=",
+            "<": "<",
+            "<=": "<=",
+            ">": ">",
+            ">=": ">=",
+            "BETWEEN": "BETWEEN",
+            "IN": "IN",
+            "contains": "CONTAINS",
+            "begins_with": "STARTSWITH",
+        }
+
+        # Basic conversion - extend based on your needs
+        if (
+            hasattr(filter_condition, "operator")
+            and hasattr(filter_condition, "attribute")
+            and hasattr(filter_condition, "value")
+        ):
+            operator = operator_map.get(filter_condition.operator)
+            if not operator:
+                raise ValueError(f"Unsupported operator: {filter_condition.operator}")
+
+            if operator in ["BETWEEN", "IN"]:
+                # Handle special cases
+                if operator == "BETWEEN":
+                    return f"c.{filter_condition.attribute} BETWEEN {filter_condition.value[0]} AND {filter_condition.value[1]}"
+                elif operator == "IN":
+                    values = ", ".join([str(v) for v in filter_condition.value])
+                    return f"c.{filter_condition.attribute} IN ({values})"
+            else:
+                return f"c.{filter_condition.attribute} {operator} {filter_condition.value}"
+
+        return ""
+
+    @classmethod
+    def _cosmos_to_model(cls, item: dict, load_full_item: bool = False) -> _T:
+        """
+        Convert Cosmos DB item to model instance
+        """
+        # Remove Cosmos DB specific fields if not needed
+        if not load_full_item:
+            item.pop("_rid", None)
+            item.pop("_self", None)
+            item.pop("_etag", None)
+            item.pop("_attachments", None)
+            item.pop("_ts", None)
+
+        return cls(**item)
+
+    @classmethod
+    def scan_aws(
+        cls: Type[_T],
+        filter_condition: Optional[ConditionBase] = None,
+        *,
+        consistent_read: bool = False,
+        index: Optional[str] = None,
+        per_page: Optional[int] = None,
+        last_evaluated_key: Optional[dict] = None,
+        load_full_item: bool = False,
+    ):
         while True:
-            result = cls.scan_page(
+            result = cls.scan_page_aws(
                 filter_condition=filter_condition,
                 consistent_read=consistent_read,
                 index=index,
@@ -311,7 +585,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
                 break
 
     @classmethod
-    def scan_page(
+    def scan_page_aws(
         cls: Type[_T],
         filter_condition: Optional[ConditionBase] = None,
         *,
@@ -331,18 +605,40 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         )
 
         raw_items = response.get("Items")
-        items = [cls._dyntastic_load_model(item, load_full_item=load_full_item) for item in raw_items]
+        items = [
+            cls._dyntastic_load_model(item, load_full_item=load_full_item)
+            for item in raw_items
+        ]
         last_evaluated_key = response.get("LastEvaluatedKey")
 
         return ResultPage(items, last_evaluated_key)
 
     def save(self, *, condition: Optional[ConditionBase] = None):
+        if host_provider == HostProvider.AWS:
+            return self.save_aws(condition=condition)
+        elif host_provider == HostProvider.AZURE:
+            return self.save_azure(condition=condition)
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
+
+    def save_azure(self, *, condition: Optional[ConditionBase] = None):
+        container_client: ContainerProxy = self._get_cosmos_client()
+        data = pydantic_compat.model_dump(self, by_alias=True)
+        data["id"] = data[self.__hash_key__]
+        item = container_client.upsert_item(data)
+        return self._cosmos_to_model(item, load_full_item=True)
+
+    def save_aws(self, *, condition: Optional[ConditionBase] = None):
         data = pydantic_compat.model_dump(self, by_alias=True)
         dynamo_serialized = attr.serialize(data)
-        return self._dyntastic_call("put_item", Item=dynamo_serialized, ConditionExpression=condition)
+        return self._dyntastic_call(
+            "put_item", Item=dynamo_serialized, ConditionExpression=condition
+        )
 
     def delete(self, *, condition: Optional[ConditionBase] = None):
-        return self._dyntastic_call("delete_item", Key=self._dyntastic_key_dict, ConditionExpression=condition)
+        return self._dyntastic_call(
+            "delete_item", Key=self._dyntastic_key_dict, ConditionExpression=condition
+        )
 
     # TODO: Support ReturnValues
     def update(
@@ -369,7 +665,10 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             self._dyntastic_unrefreshed = True
             if refresh:
                 if current_transaction_writer() is not None:
-                    warnings.warn("Cannot refresh model in transaction, skipping refresh", stacklevel=2)
+                    warnings.warn(
+                        "Cannot refresh model in transaction, skipping refresh",
+                        stacklevel=2,
+                    )
                 else:
                     # TODO: utilize ReturnValues in response when possible
                     self.refresh()
@@ -388,7 +687,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     def transaction_condition(self, condition: ConditionBase):
         transaction_writer = current_transaction_writer()
         if transaction_writer is None:
-            raise Exception(f"Cannot use {self.__class__.__name__}.transaction_condition() outside of a transaction")
+            raise Exception(
+                f"Cannot use {self.__class__.__name__}.transaction_condition() outside of a transaction"
+            )
 
         item = self._construct_transact_item(
             "transaction_condition",
@@ -416,7 +717,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     # Note: This cannot use @classmethod and @property together for python <3.9
     @classmethod
     def ConditionException(cls):
-        return cls._dynamodb_table().meta.client.exceptions.ConditionalCheckFailedException
+        return (
+            cls._dynamodb_table().meta.client.exceptions.ConditionalCheckFailedException
+        )
 
     # TODO: support more configuration for new table
     @classmethod
@@ -441,21 +744,27 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
                 index_schema = [{"AttributeName": index.hash_key, "KeyType": "HASH"}]
                 if index.range_key:
                     attributes.add(index.range_key)
-                    index_schema.append({"AttributeName": index.range_key, "KeyType": "RANGE"})
+                    index_schema.append(
+                        {"AttributeName": index.range_key, "KeyType": "RANGE"}
+                    )
 
                 secondary_indexes.append(
                     {
                         "IndexName": index.index_name,
                         "KeySchema": index_schema,
                         "Projection": {"ProjectionType": index.projection},
-                        "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+                        "ProvisionedThroughput": {
+                            "ReadCapacityUnits": 1,
+                            "WriteCapacityUnits": 1,
+                        },
                     }
                 )
 
             kwargs["GlobalSecondaryIndexes"] = secondary_indexes
 
         attribute_definitions = [
-            {"AttributeName": attr, "AttributeType": cls._dynamodb_type(attr)} for attr in attributes
+            {"AttributeName": attr, "AttributeType": cls._dynamodb_type(attr)}
+            for attr in attributes
         ]
 
         cls._dynamodb_resource().create_table(
@@ -554,7 +863,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     @classmethod
     def _dynamodb_table(cls):
         if cls._dynamodb_table_instance is None:  # type: ignore
-            cls._dynamodb_table_instance = cls._dynamodb_resource().Table(cls._resolve_table_name())  # type: ignore
+            cls._dynamodb_table_instance = cls._dynamodb_resource().Table(
+                cls._resolve_table_name()
+            )  # type: ignore
         return cls._dynamodb_table_instance  # type: ignore
 
     @classmethod
@@ -568,7 +879,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     def _wait_until_exists(cls):
         # wait a maximum of 15 * 2 = 30 seconds
         for _ in range(15):  # pragma: no cover
-            response = cls._dynamodb_client().describe_table(TableName=cls._resolve_table_name())
+            response = cls._dynamodb_client().describe_table(
+                TableName=cls._resolve_table_name()
+            )
             if response["Table"].get("TableStatus") == "ACTIVE":  # pragma: no cover
                 break
 
@@ -591,7 +904,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             key = "PutRequest"
             required_kwargs = {"Item"}
         else:  # pragma: nocover
-            raise ValueError(f"Operation {operation} not supported with {cls.__name__}.batch_writer()")
+            raise ValueError(
+                f"Operation {operation} not supported with {cls.__name__}.batch_writer()"
+            )
 
         if filtered_kwargs.keys() != required_kwargs:
             raise ValueError(
@@ -605,8 +920,12 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         filtered_kwargs["TableName"] = cls._resolve_table_name()
 
         if "ConditionExpression" in filtered_kwargs:
-            condition_data = transact.serialize_condition(filtered_kwargs["ConditionExpression"])
-            filtered_kwargs["ConditionExpression"] = condition_data["ConditionExpression"]
+            condition_data = transact.serialize_condition(
+                filtered_kwargs["ConditionExpression"]
+            )
+            filtered_kwargs["ConditionExpression"] = condition_data[
+                "ConditionExpression"
+            ]
 
             # Merging condition expression and update expression names/values so they are both present.
             # boto3 names/values look like '#n...' and ':v...', while dyntastic uses just '#...' and ':...'
@@ -619,7 +938,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
 
         for data_key in ("Key", "Item", "ExpressionAttributeValues"):
             if data_key in filtered_kwargs:
-                filtered_kwargs[data_key] = transact.serialize_data(filtered_kwargs[data_key])
+                filtered_kwargs[data_key] = transact.serialize_data(
+                    filtered_kwargs[data_key]
+                )
 
         key = {
             "delete_item": "Delete",
@@ -629,22 +950,35 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         }.get(operation)
 
         if key is None:  # pragma: nocover
-            raise ValueError(f"Operation {operation} not supported with dyntastic.TransactionWriter")
+            raise ValueError(
+                f"Operation {operation} not supported with dyntastic.TransactionWriter"
+            )
 
         return {key: filtered_kwargs}
 
     @classmethod
+    def _cosmos_call(cls, operation: str, **kwargs):
+        pass
+
+    @classmethod
     def _dyntastic_call(cls, operation: str, **kwargs):
         method = getattr(cls._dynamodb_table(), operation)
-        filtered_kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        filtered_kwargs = {
+            key: value for key, value in kwargs.items() if value is not None
+        }
 
         batch_writer = cls._dyntastic_batch_writer.get()
         transaction_writer = current_transaction_writer()
 
         if batch_writer is not None and transaction_writer is not None:
-            raise ValueError("Cannot use batch_writer() and transaction() at the same time")
+            raise ValueError(
+                "Cannot use batch_writer() and transaction() at the same time"
+            )
 
-        if (batch_writer is None and transaction_writer is None) or operation in ["query", "scan"]:
+        if (batch_writer is None and transaction_writer is None) or operation in [
+            "query",
+            "scan",
+        ]:
             return method(**filtered_kwargs)
 
         if batch_writer is not None:
@@ -654,7 +988,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             item = cls._construct_transact_item(operation, filtered_kwargs)
             transaction_writer.add(cls, item)
         else:  # pragma: nocover
-            raise Exception("Logically will always have a batch or transaction writer here")
+            raise Exception(
+                "Logically will always have a batch or transaction writer here"
+            )
 
     def ignore_unrefreshed(self):
         self._dyntastic_unrefreshed = False
@@ -731,16 +1067,22 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             raise ValueError("Dyntastic table must have __hash_key__ defined")
 
         if not _has_alias(cls, cls.__hash_key__):
-            raise ValueError(f"Dyntastic __hash_key__ is not defined as a field: '{cls.__hash_key__}'")
+            raise ValueError(
+                f"Dyntastic __hash_key__ is not defined as a field: '{cls.__hash_key__}'"
+            )
 
         if cls.__range_key__ and not _has_alias(cls, cls.__range_key__):
-            raise ValueError(f"Dyntastic __range_key__ is not defined as a field: '{cls.__range_key__}'")
+            raise ValueError(
+                f"Dyntastic __range_key__ is not defined as a field: '{cls.__range_key__}'"
+            )
 
         all_aliases = set()
         for field_name, field in pydantic_compat.model_fields(cls).items():
             field_identifier = pydantic_compat.alias(field_name, field)
             if field_identifier in all_aliases:
-                raise ValueError(f"Duplicate alias '{field_identifier}' found in {cls.__name__}")
+                raise ValueError(
+                    f"Duplicate alias '{field_identifier}' found in {cls.__name__}"
+                )
             all_aliases.add(field_identifier)
 
 
