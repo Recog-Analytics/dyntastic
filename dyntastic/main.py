@@ -19,6 +19,8 @@ from typing import (
 
 import boto3
 
+from .indexes import Index as _Index
+
 try:
     # Python 3.8+
     import importlib.metadata as _metadata
@@ -31,7 +33,6 @@ from contextvars import ContextVar
 from azure.cosmos import CosmosClient
 from azure.cosmos.container import ContainerProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError
-from azure.identity import DefaultAzureCredential
 from boto3.dynamodb.conditions import ConditionBase
 from pydantic import BaseModel, PrivateAttr
 
@@ -61,6 +62,7 @@ class _TableMetadata:
 
     __hash_key__: str
     __range_key__: Optional[str] = None
+    __indexes__: List[_Index] = []
 
 
 class ResultPage(Generic[_T]):
@@ -102,19 +104,22 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     _dyntastic_unrefreshed: bool = PrivateAttr(default=False)
     _dyntastic_missing_attributes_from_index: bool = PrivateAttr(default=False)
     _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]]
-    __database_name__: str = os.getenv("COSMOS_DATABASE_NAME")  # just for cosmos impl.
 
     @classmethod
     def _get_cosmos_client(cls) -> ContainerProxy:
         secret = os.getenv("COSMOS_SECRET")
-        if not secret:
-            raise ValueError("COSMOS_SECRET environment variable not set")
-        uri = f"https://{cls.__database_name__}.documents.azure.com:443/"
+        account_name = os.getenv("COSMOS_ACCOUNT_NAME")
+        database_name = os.getenv("COSMOS_DATABASE_NAME")
+        if not secret or not account_name or not database_name:
+            raise ValueError(
+                "COSMOS_SECRET, COSMOS_ACCOUNT_NAME, and COSMOS_DATABASE_NAME environment variables must be set"
+            )
+        uri = f"https://{account_name}.documents.azure.com:443/"
         cosmos_client = CosmosClient(
             uri,
             credential=secret,
         )
-        database_client = cosmos_client.get_database_client("relisten")
+        database_client = cosmos_client.get_database_client(database_name)
         return database_client.get_container_client(cls.__table_name__)
 
     @classmethod
@@ -325,6 +330,47 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         consistent_read: bool = False,
         range_key_condition=None,
         filter_condition: Optional[ConditionBase] = None,
+        index: Optional[_Index] = None,
+        per_page: Optional[int] = None,
+        last_evaluated_key: Optional[dict] = None,
+        scan_index_forward: bool = True,
+        load_full_item: bool = False,
+    ) -> Generator[_T, None, None]:
+        if host_provider == HostProvider.AWS:
+            return cls.query_aws(
+                hash_key,
+                consistent_read=consistent_read,
+                range_key_condition=range_key_condition,
+                filter_condition=filter_condition,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                scan_index_forward=scan_index_forward,
+                load_full_item=load_full_item,
+            )
+        elif host_provider == HostProvider.AZURE:
+            return cls.query_azure(
+                hash_key,
+                consistent_read=consistent_read,
+                range_key_condition=range_key_condition,
+                filter_condition=filter_condition,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                scan_index_forward=scan_index_forward,
+                load_full_item=load_full_item,
+            )
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
+
+    @classmethod
+    def query_azure(
+        cls: Type[_T],
+        hash_key,
+        *,
+        consistent_read: bool = False,
+        range_key_condition=None,
+        filter_condition: Optional[ConditionBase] = None,
         index: Optional[str] = None,
         per_page: Optional[int] = None,
         last_evaluated_key: Optional[dict] = None,
@@ -332,7 +378,145 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         load_full_item: bool = False,
     ) -> Generator[_T, None, None]:
         while True:
-            result = cls.query_page(
+            result = cls.query_page_azure(
+                hash_key,
+                consistent_read=consistent_read,
+                range_key_condition=range_key_condition,
+                filter_condition=filter_condition,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                scan_index_forward=scan_index_forward,
+                load_full_item=load_full_item,
+            )
+
+            last_evaluated_key = result.last_evaluated_key
+            yield from result.items
+
+            if not result.has_more:
+                break  # pragma: no cover (in python 3.8/3.9, this appeared as missing coverage)
+
+        # Add filter condition if provided
+
+    @classmethod
+    def query_page_azure(
+        cls: Type[_T],
+        hash_key: Union[str, ConditionBase],
+        *,
+        consistent_read: bool = False,
+        range_key_condition: Optional[ConditionBase] = None,
+        filter_condition: Optional[ConditionBase] = None,
+        index: Optional[str] = None,
+        per_page: Optional[int] = None,
+        last_evaluated_key: Optional[dict] = None,
+        scan_index_forward: bool = True,
+        load_full_item: bool = False,
+    ) -> ResultPage[_T]:
+        container_client = cls._get_cosmos_client()
+
+        # Build the query
+        query = "SELECT * FROM c"
+        if hash_key:
+            query += f" WHERE {cls._condition_to_cosmos(cls, hash_key)}"
+        if range_key_condition:
+            query += f" AND {cls._condition_to_cosmos(cls, range_key_condition)}"
+        if filter_condition:
+            query += f" AND {cls._condition_to_cosmos(cls, filter_condition)}"
+        if scan_index_forward:
+            if range_key_condition and index:
+                query += f" ORDER BY c.{index.__range_key__} ASC"
+            else:
+                query += f" ORDER BY c.{cls.__range_key__} ASC"
+        else:
+            if range_key_condition and index:
+                query += f" ORDER BY c.{index.__range_key__} DESC"
+            else:
+                query += f" ORDER BY c.{cls.__range_key__} DESC"
+        results = container_client.query_items(
+            query=query,
+            enable_cross_partition_query=True,
+        )
+        items = [cls._cosmos_to_model(item) for item in results]
+        return ResultPage(items, None)
+
+    def _condition_to_cosmos(self, condition: Union[str, ConditionBase]) -> str:
+        """
+        Convierte una condición de DynamoDB a una condición SQL para CosmosDB.
+
+        Args:
+            condition: Puede ser un string o un objeto ConditionBase de DynamoDB
+
+        Returns:
+            str: Condición en formato SQL para CosmosDB
+        """
+        if isinstance(condition, ConditionBase):
+            expression = condition.get_expression()
+            expression_operator = expression["operator"]
+            expression_values = expression["values"]
+
+            # Obtener el nombre del campo desde el objeto Key
+            field_name = expression_values[0].name
+
+            # Obtener el valor de comparación
+            comparison_value = expression_values[1]
+
+            # Manejar diferentes tipos de valores
+            if isinstance(comparison_value, str):
+                comparison_value = f"'{comparison_value}'"
+            elif isinstance(comparison_value, (int, float)):
+                comparison_value = str(comparison_value)
+
+            # Mapear operadores de DynamoDB a SQL
+            operator_mapping = {
+                "=": "=",
+                ">": ">",
+                "<": "<",
+                ">=": ">=",
+                "<=": "<=",
+                "<>": "!=",
+                "BETWEEN": "BETWEEN",
+                "IN": "IN",
+                "begins_with": "LIKE",
+            }
+
+            sql_operator = operator_mapping.get(
+                expression_operator, expression_operator
+            )
+
+            # Construir la condición SQL
+            if sql_operator == "BETWEEN":
+                return f"c.{field_name} BETWEEN {comparison_value[0]} AND {comparison_value[1]}"
+            elif sql_operator == "IN":
+                values_str = ", ".join(
+                    [
+                        f"'{v}'" if isinstance(v, str) else str(v)
+                        for v in comparison_value
+                    ]
+                )
+                return f"c.{field_name} IN ({values_str})"
+            elif sql_operator == "LIKE":
+                return f"c.{field_name} LIKE '{comparison_value}%'"
+            else:
+                return f"c.{field_name} {sql_operator} {comparison_value}"
+        else:
+            return str(condition)
+
+    @classmethod
+    def query_aws(
+        cls: Type[_T],
+        hash_key,
+        *,
+        consistent_read: bool = False,
+        range_key_condition=None,
+        filter_condition: Optional[ConditionBase] = None,
+        index: Optional[_Index] = None,
+        per_page: Optional[int] = None,
+        last_evaluated_key: Optional[dict] = None,
+        scan_index_forward: bool = True,
+        load_full_item: bool = False,
+    ) -> Generator[_T, None, None]:
+        while True:
+            result = cls.query_page_aws(
                 hash_key,
                 consistent_read=consistent_read,
                 range_key_condition=range_key_condition,
@@ -364,6 +548,47 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         scan_index_forward: bool = True,
         load_full_item: bool = False,
     ) -> ResultPage[_T]:
+        if host_provider == HostProvider.AWS:
+            return cls.query_page_aws(
+                hash_key,
+                consistent_read=consistent_read,
+                range_key_condition=range_key_condition,
+                filter_condition=filter_condition,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                scan_index_forward=scan_index_forward,
+                load_full_item=load_full_item,
+            )
+        elif host_provider == HostProvider.AZURE:
+            return cls.query_page_azure(
+                hash_key,
+                consistent_read=consistent_read,
+                range_key_condition=range_key_condition,
+                filter_condition=filter_condition,
+                index=index,
+                per_page=per_page,
+                last_evaluated_key=last_evaluated_key,
+                scan_index_forward=scan_index_forward,
+                load_full_item=load_full_item,
+            )
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
+
+    @classmethod
+    def query_page_aws(
+        cls: Type[_T],
+        hash_key: Union[str, ConditionBase],
+        *,
+        consistent_read: bool = False,
+        range_key_condition: Optional[ConditionBase] = None,
+        filter_condition: Optional[ConditionBase] = None,
+        index: Optional[_Index] = None,
+        per_page: Optional[int] = None,
+        last_evaluated_key: Optional[dict] = None,
+        scan_index_forward: bool = True,
+        load_full_item: bool = False,
+    ) -> ResultPage[_T]:
         if index and consistent_read:
             raise ValueError(
                 "Cannot perform a consistent read against a secondary index"
@@ -381,10 +606,15 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         if range_key_condition:
             key_condition &= range_key_condition
 
+        if index:
+            index_name = index.__index_name__
+        else:
+            index_name = None
+
         response = cls._dyntastic_call(
             "query",
             ConsistentRead=consistent_read,
-            IndexName=index,
+            IndexName=index_name,
             Limit=per_page,
             ExclusiveStartKey=last_evaluated_key,
             KeyConditionExpression=key_condition,
@@ -634,10 +864,28 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             "put_item", Item=dynamo_serialized, ConditionExpression=condition
         )
 
-    def delete(self, *, condition: Optional[ConditionBase] = None):
+    def delete_aws(self, *, condition: Optional[ConditionBase] = None):
         return self._dyntastic_call(
             "delete_item", Key=self._dyntastic_key_dict, ConditionExpression=condition
         )
+
+    def delete_azure(self):
+        container_client: ContainerProxy = self._get_cosmos_client()
+        delete_args = {}
+        if self.__range_key__:
+            delete_args["partition_key"] = self._dyntastic_key_dict[self.__range_key__]
+        else:
+            delete_args["partition_key"] = self._dyntastic_key_dict[self.__hash_key__]
+        delete_args["item"] = self._dyntastic_key_dict[self.__hash_key__]
+        return container_client.delete_item(**delete_args)
+
+    def delete(self, *, condition: Optional[ConditionBase] = None):
+        if host_provider == HostProvider.AWS:
+            return self.delete_aws(condition=condition)
+        elif host_provider == HostProvider.AZURE:
+            return self.delete_azure()
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
 
     # TODO: Support ReturnValues
     def update(
@@ -680,7 +928,12 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     def refresh(self):
         self._dyntastic_unrefreshed = False
         self._dyntastic_missing_attributes_from_index = False
-        data = self.get(self._dyntastic_hash_key, self._dyntastic_range_key)
+        if host_provider == HostProvider.AZURE:
+            data = self.get_azure(self._dyntastic_hash_key, self._dyntastic_range_key)
+        elif host_provider == HostProvider.AWS:
+            data = self.get_aws(self._dyntastic_hash_key, self._dyntastic_range_key)
+        else:
+            raise NotImplementedError(f"Host provider {host_provider} not implemented")
         self.__dict__.update(data.__dict__)
 
     def transaction_condition(self, condition: ConditionBase):
