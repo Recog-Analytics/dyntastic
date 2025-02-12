@@ -19,6 +19,7 @@ from typing import (
 
 import boto3
 
+from .constants import dynamodb_to_cosmosdb_operator_mapping
 from .indexes import Index as _Index
 
 try:
@@ -437,6 +438,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             query=query,
             enable_cross_partition_query=True,
         )
+
         items = [cls._cosmos_to_model(item) for item in results]
         return ResultPage(items, None)
 
@@ -452,15 +454,9 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             elif isinstance(comparison_value, (int, float)):
                 comparison_value = str(comparison_value)
 
-            # mapping of operators
-            operator_mapping = defaultdict(lambda: expression_operator)
-            operator_mapping.update(
-                {
-                    "<>": "!=",
-                    "begins_with": "LIKE",
-                }
+            sql_operator = dynamodb_to_cosmosdb_operator_mapping.get(
+                expression_operator, expression_operator
             )
-            sql_operator = operator_mapping[expression_operator]
 
             if sql_operator == "BETWEEN":
                 return f"c.{field_name} BETWEEN {comparison_value[0]} AND {comparison_value[1]}"
