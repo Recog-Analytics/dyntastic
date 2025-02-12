@@ -28,6 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover
     # Python 3.7
     import importlib_metadata as _metadata  # type: ignore[no-redef, unused-ignore]
 
+from collections import defaultdict
 from contextvars import ContextVar
 
 from azure.cosmos import CosmosClient
@@ -440,50 +441,27 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         return ResultPage(items, None)
 
     def _condition_to_cosmos(self, condition: Union[str, ConditionBase]) -> str:
-        """
-        Convierte una condición de DynamoDB a una condición SQL para CosmosDB.
-
-        Args:
-            condition: Puede ser un string o un objeto ConditionBase de DynamoDB
-
-        Returns:
-            str: Condición en formato SQL para CosmosDB
-        """
         if isinstance(condition, ConditionBase):
             expression = condition.get_expression()
             expression_operator = expression["operator"]
             expression_values = expression["values"]
-
-            # Obtener el nombre del campo desde el objeto Key
             field_name = expression_values[0].name
-
-            # Obtener el valor de comparación
             comparison_value = expression_values[1]
-
-            # Manejar diferentes tipos de valores
             if isinstance(comparison_value, str):
                 comparison_value = f"'{comparison_value}'"
             elif isinstance(comparison_value, (int, float)):
                 comparison_value = str(comparison_value)
 
-            # Mapear operadores de DynamoDB a SQL
-            operator_mapping = {
-                "=": "=",
-                ">": ">",
-                "<": "<",
-                ">=": ">=",
-                "<=": "<=",
-                "<>": "!=",
-                "BETWEEN": "BETWEEN",
-                "IN": "IN",
-                "begins_with": "LIKE",
-            }
-
-            sql_operator = operator_mapping.get(
-                expression_operator, expression_operator
+            # mapping of operators
+            operator_mapping = defaultdict(lambda: expression_operator)
+            operator_mapping.update(
+                {
+                    "<>": "!=",
+                    "begins_with": "LIKE",
+                }
             )
+            sql_operator = operator_mapping[expression_operator]
 
-            # Construir la condición SQL
             if sql_operator == "BETWEEN":
                 return f"c.{field_name} BETWEEN {comparison_value[0]} AND {comparison_value[1]}"
             elif sql_operator == "IN":
@@ -724,7 +702,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         else:
             last_evaluated_key = None
 
-        return items
+        yield from items
 
     @classmethod
     def _convert_filter_to_cosmos(cls, filter_condition: ConditionBase) -> str:
