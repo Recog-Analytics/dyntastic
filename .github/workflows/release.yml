@@ -36,7 +36,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.CUSTOM_GITHUB_TOKEN }}
         run: |
-          gh release create v${{ steps.get_version.outputs.version }} \
-            --title "Release v${{ steps.get_version.outputs.version }}" \
-            --notes "Release v${{ steps.get_version.outputs.version }}" \
+          gh release create ${{ steps.get_version.outputs.version }} \
+            --title "Release ${{ steps.get_version.outputs.version }}" \
+            --notes "Release ${{ steps.get_version.outputs.version }}" \
             --target ${{ github.sha }}
