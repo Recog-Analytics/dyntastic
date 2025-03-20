@@ -16,7 +16,7 @@ long_description = readme + "\n\n" + changelog
 
 setup(
     name="dyntastic",
-    version="0.15.2",
+    version="0.15.3",
     description=description,
     long_description=long_description,
     long_description_content_type="text/markdown",
