@@ -373,7 +373,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         consistent_read: bool = False,
         range_key_condition=None,
         filter_condition: Optional[ConditionBase] = None,
-        index: Optional[str] = None,
+        index: Optional[_Index] = None,
         per_page: Optional[int] = None,
         last_evaluated_key: Optional[dict] = None,
         scan_index_forward: bool = True,
@@ -408,7 +408,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         consistent_read: bool = False,
         range_key_condition: Optional[ConditionBase] = None,
         filter_condition: Optional[ConditionBase] = None,
-        index: Optional[str] = None,
+        index: Optional[_Index] = None,
         per_page: Optional[int] = None,
         last_evaluated_key: Optional[dict] = None,
         scan_index_forward: bool = True,
@@ -516,7 +516,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
         consistent_read: bool = False,
         range_key_condition: Optional[ConditionBase] = None,
         filter_condition: Optional[ConditionBase] = None,
-        index: Optional[str] = None,
+        index: Optional[_Index] = None,
         per_page: Optional[int] = None,
         last_evaluated_key: Optional[dict] = None,
         scan_index_forward: bool = True,
@@ -826,7 +826,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
 
     def save_azure(self, *, condition: Optional[ConditionBase] = None):
         container_client: ContainerProxy = self._get_cosmos_client()
-        data = pydantic_compat.model_dump(self, by_alias=True)
+        data = pydantic_compat.model_dump(self, by_alias=True, mode="json")
         data["id"] = data[self.__hash_key__]
         item = container_client.upsert_item(data)
         return self._cosmos_to_model(item, load_full_item=True)
