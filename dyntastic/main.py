@@ -473,7 +473,7 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             else:
                 return f"c.{field_name} {sql_operator} {comparison_value}"
         else:
-            return str(condition)
+            return f"c.{self.__hash_key__} = '{condition}'"
 
     @classmethod
     def query_aws(
