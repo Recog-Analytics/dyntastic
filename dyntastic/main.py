@@ -29,11 +29,11 @@ except ModuleNotFoundError:  # pragma: no cover
     # Python 3.7
     import importlib_metadata as _metadata  # type: ignore[no-redef, unused-ignore]
 
-from collections import defaultdict
 from contextvars import ContextVar
 
 from azure.cosmos import CosmosClient
 from azure.cosmos.container import ContainerProxy
+from azure.cosmos.database import DatabaseProxy
 from azure.cosmos.exceptions import CosmosHttpResponseError
 from boto3.dynamodb.conditions import ConditionBase
 from pydantic import BaseModel, PrivateAttr
@@ -55,6 +55,8 @@ class HostProvider(Enum):
 
 
 host_provider = HostProvider(os.getenv("HOST_PROVIDER", HostProvider.AWS.value))
+_container_clients: Dict[str, ContainerProxy] = {}
+_database_client: Optional[DatabaseProxy] = None
 
 
 class _TableMetadata:
@@ -102,13 +104,9 @@ class Index:
         self.index_name = index_name
 
 
-class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
-    _dyntastic_unrefreshed: bool = PrivateAttr(default=False)
-    _dyntastic_missing_attributes_from_index: bool = PrivateAttr(default=False)
-    _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]]
-
-    @classmethod
-    def _get_cosmos_client(cls) -> ContainerProxy:
+def get_database_client() -> DatabaseProxy:
+    global _database_client
+    if _database_client is None:
         secret = os.getenv("COSMOS_SECRET")
         account_name = os.getenv("COSMOS_ACCOUNT_NAME")
         database_name = os.getenv("COSMOS_DATABASE_NAME")
@@ -121,8 +119,25 @@ class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
             uri,
             credential=secret,
         )
-        database_client = cosmos_client.get_database_client(database_name)
-        return database_client.get_container_client(cls.__table_name__)
+        _database_client = cosmos_client.get_database_client(database_name)
+    return _database_client
+
+
+class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
+    _dyntastic_unrefreshed: bool = PrivateAttr(default=False)
+    _dyntastic_missing_attributes_from_index: bool = PrivateAttr(default=False)
+    _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]]
+
+    @classmethod
+    def _get_cosmos_client(cls) -> ContainerProxy:
+        global _container_clients
+        table_name = cls._resolve_table_name()
+        if table_name not in _container_clients:
+            database_client = get_database_client()
+            _container_clients[table_name] = database_client.get_container_client(
+                table_name
+            )
+        return _container_clients[table_name]
 
     @classmethod
     def get_model(cls, item: dict):
