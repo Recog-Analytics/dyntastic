@@ -126,7 +126,9 @@ def get_database_client() -> DatabaseProxy:
 class Dyntastic(_TableMetadata, pydantic_compat.BaseModel):
     _dyntastic_unrefreshed: bool = PrivateAttr(default=False)
     _dyntastic_missing_attributes_from_index: bool = PrivateAttr(default=False)
-    _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]]
+    _dyntastic_batch_writer: ContextVar[Optional[BatchWriter]] = PrivateAttr(
+        ContextVar("dyntastic_batch_writer", default=None)
+    )
 
     @classmethod
     def _get_cosmos_client(cls) -> ContainerProxy:
